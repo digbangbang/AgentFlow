@@ -1,19 +1,21 @@
 # config.yaml
 env:
   OPENAI_API_KEY: "YOUR_ONENAI_API" # not that neccesary
-  CUDA_VISIBLE_DEVICES: '0,1,2,3,4,5,6,7'
+  CUDA_VISIBLE_DEVICES: '0'
   HYDRA_FULL_ERROR: 1
-  N_GPUS: 8
-  BASE_MODEL: 'Qwen/Qwen2.5-7B-Instruct' # This model here would be served in vllm used by `agentflow.port` and serve as base model of rollout in the training process. 
+  N_GPUS: 1
+  BASE_MODEL: 'Qwen/Qwen3-1.7B' # This model here would be served in vllm used by `agentflow.port` and serve as base model of rollout in the training process. 
   ROLLOUT_TP_SIZE: 1
-  EXPERIMENT_NAME: 'rollout_all_7B_useklloss'
+  EXPERIMENT_NAME: 'rollout_all_1.7B_useklloss'
   PROJECT_NAME: 'AgentFlow_general'
   BASE_DATA_DIR: 'data' # where to find train and val data
   VERBOSITY: 'DEBUG'
-  N_WORKERS: 16
-  ENABLE_TOOLS: ["Base_Generator_Tool","Python_Coder_Tool","Google_Search_Tool","Wikipedia_Search_Tool"] # if openai API is on then can add tools
-  TOOL_ENGINE: ["dashscope","dashscope","Default","Default"] # Default means use tool.py 's default params, you can set "dashscope" as qwen7B, "gpt-40-mini" for gpt, "self" as the training BASE_MODEL
+  N_WORKERS: 8
+  # ENABLE_TOOLS: ["Base_Generator_Tool","Python_Coder_Tool","Google_Search_Tool","Wikipedia_Search_Tool"] # if openai API is on then can add tools
+  # TOOL_ENGINE: ["dashscope","dashscope","Default","Default"] # Default means use tool.py 's default params, you can set "dashscope" as qwen7B, "gpt-40-mini" for gpt, "self" as the training BASE_MODEL
   # TOOL_ENGINE: ["vllm-Qwen/Qwen2.5-7B-Instruct","vllm-Qwen/Qwen2.5-7B-Instruct","Default","Default"] # if you are not using dashscope api., you can use vllm to serve the qwen2.5-7b-instruct in your own server and please redsign the llm_engine port. .
+  ENABLE_TOOLS: ["Base_Generator_Tool","Python_Coder_Tool"]
+  TOOL_ENGINE: ["self","self"]
   TOOL_STEPS: 3 # do not too long 3-5 is good cause it may surge the context
   TEST_TEMPERATURE: 0.0
   TRAIN_TEMPERATURE: 0.7 # 0.7 - 0.5 is good please check whether every planner and the executor are correctly transfered this parameter
@@ -27,11 +29,11 @@ python_args:
   data.val_files: '${BASE_DATA_DIR}/val/aime24.parquet' # AIME24 for fast check, the first epoch maybe down due to async start and fiel lock
   actor_rollout_ref.rollout.tensor_model_parallel_size: '${ROLLOUT_TP_SIZE}'
   trainer.n_gpus_per_node: '${N_GPUS}'
-  data.train_batch_size: 32
-  actor_rollout_ref.rollout.n: 8
-  actor_rollout_ref.actor.ppo_mini_batch_size: 8
-  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu: 4
-  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu: 4
+  data.train_batch_size: 1
+  actor_rollout_ref.rollout.n: 1
+  actor_rollout_ref.actor.ppo_mini_batch_size: 1
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu: 1
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu: 1
   actor_rollout_ref.rollout.multi_turn.format: 'hermes'
   actor_rollout_ref.model.path: '${BASE_MODEL}'
   data.max_prompt_length: 18432 # it's safe here because in qwen-plannr&executor, dashscope/4o-mini in tools this length will never shut
@@ -50,7 +52,7 @@ python_args:
   actor_rollout_ref.actor.fsdp_config.optimizer_offload: False
   actor_rollout_ref.rollout.name: 'vllm'
   actor_rollout_ref.rollout.gpu_memory_utilization: 0.6 # 0.55-0.65 is fine, too small the BASE_MODEL inference will be slow, too large, the kvcache and other extra saved logic will cause OOM
-  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu: 4
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu: 1
   actor_rollout_ref.ref.fsdp_config.param_offload: False
   algorithm.use_kl_in_reward: False
   trainer.critic_warmup: 0

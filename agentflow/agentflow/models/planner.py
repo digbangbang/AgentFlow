@@ -51,7 +51,7 @@ class Planner:
 
 
         print("Input data of `generate_base_response()`: ", input_data)
-        self.base_response = self.llm_engine(input_data, max_tokens=max_tokens)
+        self.base_response = self.llm_engine(input_data, max_tokens=max_tokens) # default system prompt with question
         # self.base_response = self.llm_engine_fixed(input_data, max_tokens=max_tokens)
 
         return self.base_response
@@ -120,7 +120,7 @@ Be biref and precise with insight.
 
         # self.query_analysis = self.llm_engine_mm(input_data, response_format=QueryAnalysis)
         # self.query_analysis = self.llm_engine(input_data, response_format=QueryAnalysis)
-        self.query_analysis = self.llm_engine_fixed(input_data, response_format=QueryAnalysis)
+        self.query_analysis = self.llm_engine_fixed(input_data, response_format=QueryAnalysis) # default dashscope don't need response_format, but openai supports it
 
         return str(self.query_analysis).strip()
 

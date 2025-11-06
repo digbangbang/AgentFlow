@@ -283,9 +283,9 @@ if __name__ == "__main__":
     import json
 
     # Example usage of the Web_Search_Tool
-    tool = Web_Search_Tool(model_string="gpt-4o-mini") # NOTE: strong LLM for tool
+    # tool = Web_Search_Tool(model_string="gpt-4o-mini") # NOTE: strong LLM for tool
     # tool = Web_Search_Tool(model_string="gemini-1.5-flash") # NOTE: weak 8B model for tool
-    # tool = Web_Search_Tool(model_string="dashscope") # NOTE: weak Qwen2.5-7B model for tool
+    tool = Web_Search_Tool(model_string="dashscope") # NOTE: weak Qwen2.5-7B model for tool
 
     # Get tool metadata
     metadata = tool.get_metadata()

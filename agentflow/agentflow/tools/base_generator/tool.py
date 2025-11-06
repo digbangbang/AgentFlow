@@ -102,11 +102,11 @@ if __name__ == "__main__":
     print(f"Script directory: {script_dir}")
 
     # Example usage of the Generalist_Tool
-    tool = Base_Generator_Tool()
+    # tool = Base_Generator_Tool()
 
-    tool = Base_Generator_Tool(model_string="gpt-4o-mini") # NOTE: strong LLM for tool
+    # tool = Base_Generator_Tool(model_string="gpt-4o-mini") # NOTE: strong LLM for tool
     # tool = Base_Generator_Tool(model_string="gemini-1.5-flash") # NOTE: weak 8B model for tool
-    # tool = Base_Generator_Tool(model_string="dashscope") # NOTE: weak Qwen2.5-7B model for tool
+    tool = Base_Generator_Tool(model_string="dashscope") # NOTE: weak Qwen2.5-7B model for tool
 
 
     # Get tool metadata

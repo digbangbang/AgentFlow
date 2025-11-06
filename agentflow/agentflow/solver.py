@@ -145,7 +145,7 @@ class Solver:
 
                 # Update memory
                 self.memory.add_action(step_count, tool_name, sub_goal, command, result)
-                memory_actions = self.memory.get_actions()
+                memory_actions = self.memory.get_actions() # total memory actions up to now
 
                 # [5] Verify memory (context verification)
                 local_start_time = time.time()

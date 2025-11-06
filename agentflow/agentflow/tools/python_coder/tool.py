@@ -348,9 +348,9 @@ if __name__ == "__main__":
 
     # Sample query for generating and executing Python code
     queries = [
-        # "Given the number list: [1, 2, 3, 4, 5], calculate the sum of all the numbers in the list.",
+        "Given the number list: [1, 2, 3, 4, 5], calculate the sum of all the numbers in the list.",
         # "Print numbers from 1 to 1000 in a loop to test output truncation",
-        "Create a list variable containing all numbers from 1 to 5000 to test variable truncation",
+        # "Create a list variable containing all numbers from 1 to 5000 to test variable truncation",
     ]
     for query in queries:
         print(f"\n###Query: {query}")
