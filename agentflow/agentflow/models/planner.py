@@ -1,12 +1,21 @@
 import json
 import os
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
 
 from agentflow.engine.factory import create_llm_engine
-from agentflow.models.formatters import MemoryVerification, NextStep, QueryAnalysis
+from agentflow.models.formatters import (
+    MemoryVerification,
+    NextStep,
+    PlanOutline,
+    PlanStep,
+    QueryAnalysis,
+    WorkerProgressCheck,
+    WorkerSpecification,
+    WorkerSummary,
+)
 from agentflow.models.memory import Memory
 
 
@@ -16,12 +25,128 @@ class Planner:
         self.llm_engine_name = llm_engine_name
         self.is_multimodal = is_multimodal
         # self.llm_engine_mm = create_llm_engine(model_string=llm_engine_name, is_multimodal=False, base_url=base_url, temperature = temperature)
-        self.llm_engine_fixed = create_llm_engine(model_string="dashscope", is_multimodal=False, temperature = temperature)
+        # self.llm_engine_fixed = create_llm_engine(model_string="dashscope", is_multimodal=False, temperature = temperature)
+        self.llm_engine_fixed = create_llm_engine(model_string=llm_engine_name, is_multimodal=False, base_url=base_url, temperature = temperature)
         self.llm_engine = create_llm_engine(model_string=llm_engine_name, is_multimodal=False, base_url=base_url, temperature = temperature)
         self.toolbox_metadata = toolbox_metadata if toolbox_metadata is not None else {}
         self.available_tools = available_tools if available_tools is not None else []
 
         self.verbose = verbose
+
+    def _coerce_plan_outline(self, raw_plan: Any, max_subtasks: int) -> PlanOutline:
+        """Convert model output into PlanOutline, falling back if parsing fails."""
+        parsed_payload = None
+
+        txt = raw_plan.strip()
+        txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL).strip()
+        
+        try:
+            parsed_payload = json.loads(txt)
+        except Exception as exc:
+            if self.verbose:
+                print(f"Planner generate_plan: JSON parsing failed: {exc}")
+
+        if parsed_payload is not None:
+            try:
+                plan = PlanOutline(**parsed_payload)
+                return self._truncate_plan_steps(plan, max_subtasks)
+            except Exception as exc:
+                if self.verbose:
+                    print(f"Planner generate_plan: PlanOutline construction failed: {exc}. Using fallback plan outline.")
+
+        return self._build_fallback_plan(max_subtasks)
+
+    def _truncate_plan_steps(self, plan: PlanOutline, max_subtasks: int) -> PlanOutline:
+        if not plan.steps:
+            return self._build_fallback_plan(max_subtasks)
+
+        trimmed_steps = plan.steps[:max_subtasks]
+        normalized_steps: List[PlanStep] = []
+        for index, step in enumerate(trimmed_steps, start=1):
+            suggested = list(step.suggested_tools) if step.suggested_tools else []
+            normalized_steps.append(
+                PlanStep(
+                    step_id=index,
+                    title=step.title,
+                    objective=step.objective,
+                    success_criteria=step.success_criteria,
+                    suggested_tools=suggested,
+                    handoff_notes=step.handoff_notes,
+                ),
+            )
+        return PlanOutline(reasoning=plan.reasoning, steps=normalized_steps)
+
+    def _build_fallback_plan(self, max_subtasks: int) -> PlanOutline:
+
+        step_templates = [
+            {
+                "title": "Understand the query",
+                "objective": "Summarize the task requirements and note available context",
+                "success_criteria": "Key objectives and constraints captured clearly",
+                "handoff_notes": "Provide a concise brief for execution",
+            },
+            {
+                "title": "Execute tooling workflow",
+                "objective": "Use the most relevant tools to address the core objective",
+                "success_criteria": "Question answered or artefact produced with tool outputs",
+                "handoff_notes": "Highlight important results for synthesis",
+            },
+            {
+                "title": "Synthesize final response",
+                "objective": "Compile findings into a coherent final answer",
+                "success_criteria": "Final answer ready for user consumption",
+                "handoff_notes": "",
+            },
+        ]
+
+        steps_to_create = min(max_subtasks, len(step_templates)) or 1
+
+        fallback_steps: List[PlanStep] = []
+        for idx in range(steps_to_create):
+            template = step_templates[idx]
+            fallback_steps.append(
+                PlanStep(
+                    step_id=idx + 1,
+                    title=template["title"],
+                    objective=template["objective"],
+                    success_criteria=template["success_criteria"],
+                    suggested_tools=self.available_tools,
+                    handoff_notes=template["handoff_notes"],
+                ),
+            )
+
+        return PlanOutline(
+            reasoning="Fallback plan generated because model output could not be parsed.",
+            steps=fallback_steps,
+        )
+
+    def _normalize_tool_name(
+        self,
+        tool_name: str,
+        allowed_tools: Optional[List[str]] = None,
+    ) -> str:
+        """Normalize tool names to match available tool identifiers."""
+
+        allowed = allowed_tools if allowed_tools is not None else self.available_tools
+
+        def to_canonical(name: str) -> str:
+            return "_".join(part.lower() for part in re.split(r"[ _]+", name.strip()))
+
+        normalized_input = to_canonical(tool_name)
+        for tool in allowed:
+            if to_canonical(tool) == normalized_input:
+                return tool
+        return tool_name
+
+    def _filter_tool_metadata(self, tools: List[str]) -> Dict[str, Any]:
+        """Return toolbox metadata limited to the provided tool names."""
+
+        return {
+            tool: self.toolbox_metadata.get(tool, {})
+            for tool in tools
+            if tool in self.toolbox_metadata
+        }
+    
     def get_image_info(self, image_path: str) -> Dict[str, Any]:
         image_info = {}
         if image_path and os.path.isfile(image_path):
@@ -55,6 +180,398 @@ class Planner:
         # self.base_response = self.llm_engine_fixed(input_data, max_tokens=max_tokens)
 
         return self.base_response
+
+    def generate_plan(
+        self,
+        question: str,
+        image: Optional[str],
+        max_subtasks: int = 5,
+        json_data: Any = None,
+    ) -> PlanOutline:
+
+        image_info = self.get_image_info(image)
+
+        shared_instructions = f"""
+        Task: You are the planning coordinator for DynamicFlow. Decompose the user task into a roadmap for planner-worker collaboration.
+
+        Inputs:
+        - Query: {question}
+        - Available Tools: {self.available_tools}
+        - Tool Metadata: {self.toolbox_metadata}
+        - Maximum Number of Subtasks: {max_subtasks}
+
+        Planning Expectations:
+        1. Produce an ordered sequence of **1 to {max_subtasks} subtasks**, arranged by logical dependency and difficulty.
+        2. Each subtask must have **one actionable, well-defined objective** that can be completed using the tools listed in Available Tools. Reference tool names exactly as provided.
+        3. For every subtask, define:
+        - **success_criteria**: what conditions mark this step as “done”
+        - **handoff_notes**: what the next worker needs to know for smooth continuation
+        4. Subtasks should remain focused, practical, and minimally overlapping. Avoid unnecessary complexity.
+
+        Example:
+        - Query: "Please identify which column in the CSV file I uploaded is most related to housing prices, and give me a brief analytical summary."
+        - Response: 
+        {{
+        "reasoning": "To determine which column is most correlated with housing price, we must first load the dataset, inspect the schema, compute correlations, and then generate a natural-language summary. Python is suitable for data processing, while the generator tool is needed to produce a readable explanation.",
+        "steps": [
+            {{
+            "step_id": 1,
+            "title": "Load and inspect dataset",
+            "objective": "Use Python to read the CSV file, list all columns, display data types, and show sample rows.",
+            "success_criteria": "Dataset successfully loaded with schema summary and preview available.",
+            "suggested_tools": ["Python_Code_Generator_Tool"],
+            "handoff_notes": "Provide the list of numerical columns for correlation calculation."
+            }},
+            {{
+            "step_id": 2,
+            "title": "Compute correlations with target column",
+            "objective": "Use Python to compute Pearson correlation between each numerical column and the 'price' column.",
+            "success_criteria": "Sorted list of correlations showing which column has the strongest relationship with price.",
+            "suggested_tools": ["Python_Code_Generator_Tool"],
+            "handoff_notes": "Provide the highest-correlation column and values to the generator for explanation."
+            }},
+            {{
+            "step_id": 3,
+            "title": "Generate interpretation summary",
+            "objective": "Use the generator tool to convert the correlation results into a concise explanation describing the main influencing feature of price.",
+            "success_criteria": "A clear, coherent summary highlighting the most relevant column and why it correlates with price.",
+            "suggested_tools": ["Generalist_Solution_Generator_Tool"],
+            "handoff_notes": ""
+            }}
+        ]
+        }}
+
+        Return only valid JSON that conforms to this PlanOutline schema.
+        """
+
+        if self.is_multimodal and image_info:
+            multimodal_prompt = (
+                shared_instructions
+                + "\nImage Context: "
+                + json.dumps(image_info, ensure_ascii=False)
+                + "\nIncorporate visual insights when relevant."
+            )
+        else:
+            multimodal_prompt = shared_instructions
+
+        raw_plan: Any = None
+
+        try:
+            if self.is_multimodal and image_info and image_info.get("image_path"):
+                with open(image_info["image_path"], "rb") as file:
+                    image_bytes = file.read()
+                raw_plan = self.llm_engine(
+                    [multimodal_prompt, image_bytes],
+                    response_format=PlanOutline,
+                )
+            else:
+                raw_plan = self.llm_engine(multimodal_prompt, response_format=PlanOutline)
+        except Exception as exc:
+            if self.verbose:
+                print(f"Planner generate_plan structured call failed: {exc}")
+
+        plan = self._coerce_plan_outline(raw_plan, max_subtasks)
+
+        if json_data is not None:
+            json_data["plan_prompt"] = multimodal_prompt
+            if isinstance(raw_plan, (str, dict)):
+                json_data["plan_raw_response"] = raw_plan
+            json_data["plan_response"] = plan.model_dump()
+
+        return plan
+
+    def design_worker(
+        self,
+        question: str,
+        plan_step: PlanStep,
+        global_memory: Memory,
+        existing_workers: List[Dict[str, Any]],
+        image: Optional[str] = None,
+        json_data: Any = None,
+    ) -> WorkerSpecification:
+        memory_snapshot = json.dumps(
+            global_memory.get_actions(),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+        existing_workers_str = json.dumps(
+            existing_workers,
+            ensure_ascii=False,
+            indent=2,
+        )
+        # available_tools_str = json.dumps(self.available_tools, ensure_ascii=False)
+        image_info = self.get_image_info(image)
+
+        prompt = f"""
+        Task: You are coordinating workers for DynamicFlow.
+
+        Input:
+        - Query: {question}
+        - Plan Step {plan_step.step_id}: {plan_step.title}
+        - Objective: {plan_step.objective}
+        - Success Criteria: {plan_step.success_criteria}
+        - Suggested Tools: {plan_step.suggested_tools}
+        - Handoff Notes: {plan_step.handoff_notes}
+        - Existing Workers: {existing_workers_str}
+        - Accumulated Memory: {memory_snapshot}
+        - Available Tools: {self.available_tools}
+
+        Design a single worker specialized for this plan step.  
+        
+        Worker Expectations:
+        1. Be actionable and role-specific.
+        2. Use tool names strictly as listed in "Available Tools" and choose only the most relevant ones.
+        3. Align closely with the success criteria and objective.
+        4. Include a precise system prompt that will guide the worker's behavior.
+
+        Example:
+        - Input:
+            - query = "Please identify which column in the CSV file I uploaded is most related to housing prices, and give me a brief analytical summary."
+            - step_id = 1
+            - title = "Load and inspect dataset"
+            - objective = "Use Python to read the CSV file, list all columns, display data types, and show sample rows."
+            - success_criteria = "Dataset successfully loaded with schema summary and preview available."
+            - suggested_tools = ["Python_Code_Generator_Tool"]
+            - handoff_notes = "Provide the list of numerical columns for correlation calculation."
+
+        - Output:
+        {{
+        "worker_name": "DatasetInspector",
+        "worker_role": "Reads and inspects tabular datasets",
+        "mission": "Load the dataset from the provided path, show schema, types, and preview rows.",
+        "context": "User needs initial dataset understanding for downstream correlation analysis.",
+        "tool_names": ["Python_Code_Generator_Tool"],
+        "success_criteria": [
+            "Dataset loaded without errors",
+            "Columns listed with data types",
+            "Sample rows shown",
+            "Numerical columns identified for next step"
+        ],
+        "system_prompt": "You are a dataset inspection worker. Load the dataset, summarize its schema, preview rows, and extract numerical columns."
+        }}
+        """
+        breakpoint()
+        def _coerce_spec_construct(raw_spec: Any) -> WorkerSpecification:
+            """Convert model output into WorkerSpecification, falling back if parsing fails."""
+            parsed_payload = None
+            breakpoint()
+            txt = raw_spec.strip()
+            txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL).strip()
+            
+            try:
+                parsed_payload = json.loads(txt)
+            except Exception as exc:
+                if self.verbose:
+                    print(f"Planner design_worker: JSON parsing failed: {exc}")
+
+            if parsed_payload is not None:
+                try:
+                    spec = WorkerSpecification(**parsed_payload)
+                    return spec
+                except Exception as exc:
+                    if self.verbose:
+                        print(f"Planner design_worker: WorkerSpecification construction failed: {exc}. Using fallback worker outline.")
+            
+            spec = WorkerSpecification(
+                worker_name=f"worker_step_{plan_step.step_id}",
+                worker_role="Specialist",
+                mission=plan_step.objective,
+                context=f"Carry out plan step {plan_step.step_id} for the query.",
+                tool_names=plan_step.suggested_tools,
+                success_criteria=[plan_step.success_criteria],
+                system_prompt=(
+                    "You are a focused DynamicFlow worker. Complete the assigned subtask "
+                    "using the provided tools and document outcomes for the planner."
+                ),
+            )
+            return spec
+
+        raw_spec: Any = None
+
+        raw_spec = self.llm_engine(prompt, response_format=WorkerSpecification)
+        spec = _coerce_spec_construct(raw_spec)
+
+        if json_data is not None:
+            json_data[f"worker_{plan_step.step_id}_design_prompt"] = prompt
+            json_data[f"worker_{plan_step.step_id}_design_response"] = spec.model_dump()
+
+        return spec
+
+    def generate_worker_step(
+        self,
+        question: str,
+        image: str,
+        plan_step: PlanStep,
+        worker_spec: WorkerSpecification,
+        worker_memory: Memory,
+        global_memory: Memory,
+        step_count: int,
+        max_step_count: int,
+        json_data: Any = None,
+    ) -> Any:
+        metadata_subset = self._filter_tool_metadata(worker_spec.tool_names)
+        worker_memory_snapshot = json.dumps(
+            worker_memory.get_actions(),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+        global_memory_snapshot = json.dumps(
+            global_memory.get_actions(),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+        image_info = self.get_image_info(image)
+
+        prompt = f"""
+You are worker {worker_spec.worker_name} ({worker_spec.worker_role}).
+Mission: {worker_spec.mission}
+Plan Step {plan_step.step_id}: {plan_step.title}
+Success Criteria: {plan_step.success_criteria}
+Worker-Specific Success Criteria: {worker_spec.success_criteria}
+Handoff Notes: {plan_step.handoff_notes}
+Image Context: {image_info if image_info else 'None'}
+
+Global Memory Snapshot: {global_memory_snapshot}
+Worker Memory Snapshot: {worker_memory_snapshot}
+
+Available Tools: {worker_spec.tool_names}
+Tool Metadata: {metadata_subset}
+Current Step: {step_count} of {max_step_count}
+
+Decide the optimal next action. Use ONLY the available tools. Respond using the NextStep schema.
+"""
+
+        try:
+            next_step = self.llm_engine(prompt, response_format=NextStep)
+            if json_data is not None:
+                key = f"worker_{worker_spec.worker_name}_step_{step_count}_predictor"
+                json_data[f"{key}_prompt"] = prompt
+                json_data[f"{key}_response"] = next_step.model_dump()
+            return next_step
+        except Exception as exc:
+            if self.verbose:
+                print(f"Planner generate_worker_step failed, using fallback: {exc}")
+            fallback_tool = worker_spec.tool_names[0] if worker_spec.tool_names else None
+            return NextStep(
+                justification="Fallback action due to model error.",
+                context="Refer to previous outputs and mission description to proceed manually.",
+                sub_goal=plan_step.objective,
+                tool_name=fallback_tool or "",
+            )
+
+    def evaluate_worker_progress(
+        self,
+        question: str,
+        plan_step: PlanStep,
+        worker_spec: WorkerSpecification,
+        worker_memory: Memory,
+        global_memory: Memory,
+        json_data: Any = None,
+    ) -> WorkerProgressCheck:
+        worker_memory_snapshot = json.dumps(
+            worker_memory.get_actions(),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+        global_memory_snapshot = json.dumps(
+            global_memory.get_actions(),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+
+        prompt = f"""
+Evaluate the progress of worker {worker_spec.worker_name} on Plan Step {plan_step.step_id}.
+
+User Query: {question}
+Plan Step Objective: {plan_step.objective}
+Plan Step Success Criteria: {plan_step.success_criteria}
+Worker Success Criteria: {worker_spec.success_criteria}
+Worker Memory: {worker_memory_snapshot}
+Global Memory: {global_memory_snapshot}
+
+Return a JSON object with fields:
+{{
+  "analysis": "Detailed assessment",
+  "status": "complete" or "continue",
+  "blockers": "Any blockers preventing completion",
+  "next_action": "Recommended next action"
+}}
+"""
+
+        try:
+            evaluation = self.llm_engine(prompt, response_format=WorkerProgressCheck)
+            if json_data is not None:
+                key = f"worker_{worker_spec.worker_name}_progress"
+                json_data[f"{key}_prompt"] = prompt
+                json_data[f"{key}_response"] = evaluation.model_dump()
+            return evaluation
+        except Exception as exc:
+            if self.verbose:
+                print(f"Planner evaluate_worker_progress failed, using fallback: {exc}")
+            return WorkerProgressCheck(
+                analysis="Unable to assess progress due to parsing error.",
+                status="continue",
+                blockers="Assessment fallback invoked",
+                next_action="Planner should manually review worker outputs",
+            )
+
+    def summarize_worker_result(
+        self,
+        question: str,
+        plan_step: PlanStep,
+        worker_spec: WorkerSpecification,
+        worker_memory: Memory,
+        global_memory: Memory,
+        json_data: Any = None,
+    ) -> WorkerSummary:
+        worker_memory_snapshot = json.dumps(
+            worker_memory.get_actions(),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+        global_memory_snapshot = json.dumps(
+            global_memory.get_actions(),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+
+        prompt = f"""
+Create a concise summary for plan step {plan_step.step_id} executed by worker {worker_spec.worker_name}.
+
+User Query: {question}
+Plan Step Objective: {plan_step.objective}
+Worker Success Criteria: {worker_spec.success_criteria}
+Worker Memory: {worker_memory_snapshot}
+Global Memory: {global_memory_snapshot}
+
+Return a JSON object with fields:
+{{
+  "summary": "Narrative summary of what was done and found",
+  "follow_up": "Notes for the planner or next worker"
+}}
+"""
+
+        try:
+            summary = self.llm_engine(prompt, response_format=WorkerSummary)
+            if json_data is not None:
+                key = f"worker_{worker_spec.worker_name}_summary"
+                json_data[f"{key}_prompt"] = prompt
+                json_data[f"{key}_response"] = summary.model_dump()
+            return summary
+        except Exception as exc:
+            if self.verbose:
+                print(f"Planner summarize_worker_result failed, using fallback: {exc}")
+            return WorkerSummary(
+                summary="Worker summary unavailable; planner must synthesize manually.",
+                follow_up="Investigate worker outputs manually.",
+            )
 
     def analyze_query(self, question: str, image: str) -> str:
         image_info = self.get_image_info(image)
@@ -124,27 +641,12 @@ Be biref and precise with insight.
 
         return str(self.query_analysis).strip()
 
-    def extract_context_subgoal_and_tool(self, response: Any) -> Tuple[str, str, str]:
-
-        def normalize_tool_name(tool_name: str) -> str:
-            """
-            Normalizes a tool name robustly using regular expressions.
-            It handles any combination of spaces and underscores as separators.
-            """
-            def to_canonical(name: str) -> str:
-                # Split the name by any sequence of one or more spaces or underscores
-                parts = re.split('[ _]+', name)
-                # Join the parts with a single underscore and convert to lowercase
-                return "_".join(part.lower() for part in parts)
-
-            normalized_input = to_canonical(tool_name)
-            
-            for tool in self.available_tools:
-                if to_canonical(tool) == normalized_input:
-                    return tool
-                    
-            return f"No matched tool given: {tool_name}"
-
+    def extract_context_subgoal_and_tool(
+        self,
+        response: Any,
+        allowed_tools: Optional[List[str]] = None,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        tools_reference = allowed_tools if allowed_tools is not None else self.available_tools
         try:
             if isinstance(response, str):
                 # Attempt to parse the response as JSON
@@ -172,7 +674,9 @@ Be biref and precise with insight.
                 context, sub_goal, tool_name = matches[-1]
                 context = context.strip()
                 sub_goal = sub_goal.strip()
-            tool_name = normalize_tool_name(tool_name)
+
+            if tools_reference and tool_name not in tools_reference:
+                return context, sub_goal, None
         except Exception as e:
             print(f"Error extracting context, sub-goal, and tool name: {str(e)}")
             return None, None, None

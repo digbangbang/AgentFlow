@@ -1,4 +1,6 @@
-from pydantic import BaseModel
+from typing import List
+
+from pydantic import BaseModel, Field
 
 # Planner: QueryAnalysis
 class QueryAnalysis(BaseModel):
@@ -38,3 +40,40 @@ class ToolCommand(BaseModel):
     analysis: str
     explanation: str
     command: str
+
+
+# Planner-Worker workflow: plan decomposition
+class PlanStep(BaseModel):
+    step_id: int
+    title: str
+    objective: str
+    success_criteria: str
+    suggested_tools: List[str] = Field(default_factory=list)
+    handoff_notes: str = ""
+
+
+class PlanOutline(BaseModel):
+    reasoning: str
+    steps: List[PlanStep]
+
+
+class WorkerSpecification(BaseModel):
+    worker_name: str
+    worker_role: str
+    mission: str
+    context: str
+    tool_names: List[str] = Field(default_factory=list)
+    success_criteria: List[str] = Field(default_factory=list)
+    system_prompt: str
+
+
+class WorkerProgressCheck(BaseModel):
+    analysis: str
+    status: str
+    blockers: str
+    next_action: str
+
+
+class WorkerSummary(BaseModel):
+    summary: str
+    follow_up: str

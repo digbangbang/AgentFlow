@@ -7,16 +7,17 @@ from agentflow.models.initializer import Initializer
 from agentflow.models.planner import Planner
 from agentflow.models.memory import Memory
 from agentflow.models.executor import Executor
-from agentflow.models.utils import make_json_serializable_truncated
+from agentflow.models.worker import WorkerManager
 
 class Solver:
     def __init__(
         self,
-        planner,
-        memory,
-        executor,
+        planner: Planner,
+        memory: Memory,
+        executor: Executor,
         output_types: str = "base,final,direct",
         max_steps: int = 10,
+        max_subtasks: int = 5,
         max_time: int = 300,
         max_tokens: int = 4000,
         root_cache_dir: str = "cache",
@@ -27,6 +28,7 @@ class Solver:
         self.memory = memory
         self.executor = executor
         self.max_steps = max_steps
+        self.max_subtasks = max_subtasks
         self.max_time = max_time
         self.max_tokens = max_tokens
         self.root_cache_dir = root_cache_dir
@@ -35,160 +37,154 @@ class Solver:
         self.temperature  = temperature
         assert all(output_type in ["base", "final", "direct"] for output_type in self.output_types), "Invalid output type. Supported types are 'base', 'final', 'direct'."
         self.verbose = verbose
-    def solve(self, question: str, image_path: Optional[str] = None):
-        """
-        Solve a single problem from the benchmark dataset.
-        
-        Args:
-            index (int): Index of the problem to solve
-        """
-        # Update cache directory for the executor
-        self.executor.set_query_cache_dir(self.root_cache_dir)
 
-        # Initialize json_data with basic problem information
+    def solve(self, question: str, image_path: Optional[str] = None):
+        """Solve a query using the planner-worker workflow."""
+
+        self.executor.set_query_cache_dir(self.root_cache_dir)
+        self.memory.set_query(question)
+
         json_data = {
             "query": question,
-            "image": image_path
+            "image": image_path,
         }
+
         if self.verbose:
             print(f"\n==> 🔍 Received Query: {question}")
             if image_path:
                 print(f"\n==> 🖼️ Received Image: {image_path}")
 
-        # Generate base response if requested
-        if 'base' in self.output_types:
-            base_response = self.planner.generate_base_response(question, image_path, self.max_tokens)
+        if "base" in self.output_types:
+            base_response = self.planner.generate_base_response(
+                question,
+                image_path,
+                self.max_tokens,
+            )
             json_data["base_response"] = base_response
             if self.verbose:
                 print(f"\n==> 📝 Base Response from LLM:\n\n{base_response}")
 
-        # If only base response is needed, save and return
-        if set(self.output_types) == {'base'}:
+        if set(self.output_types) == {"base"}:
             return json_data
-    
-        # Continue with query analysis and tool execution if final or direct responses are needed
-        if {'final', 'direct'} & set(self.output_types):
-            if self.verbose:
-                print(f"\n==> 🐙 Reasoning Steps from AgentFlow (Deep Thinking...)")
 
-            # [1] Analyze query
-            query_start_time = time.time()
-            query_analysis = self.planner.analyze_query(question, image_path)
-            json_data["query_analysis"] = query_analysis
-            if self.verbose:
-                print(f"\n==> 🔍 Step 0: Query Analysis\n")
-                print(f"{query_analysis}")
-                print(f"[Time]: {round(time.time() - query_start_time, 2)}s")
+        start_time = time.time()
 
-            # Main execution loop
-            step_count = 0
-            action_times = []
-            while step_count < self.max_steps and (time.time() - query_start_time) < self.max_time:
-                step_count += 1
-                step_start_time = time.time()
+        plan_outline = self.planner.generate_plan(
+            question=question,
+            image=image_path,
+            max_subtasks=self.max_subtasks,
+            json_data=json_data,
+        )
+        json_data["plan"] = plan_outline.model_dump()
 
-                # [2] Generate next step
-                local_start_time = time.time()
-                next_step = self.planner.generate_next_step(
-                    question, 
-                    image_path, 
-                    query_analysis, 
-                    self.memory, 
-                    step_count, 
-                    self.max_steps,
-                    json_data
+        if self.verbose:
+            print("\n==> 🧭 Planner Roadmap")
+            print(plan_outline.reasoning)
+            for step in plan_outline.steps:
+                tool_list = ", ".join(step.suggested_tools) if step.suggested_tools else "(planner to decide)"
+                print(
+                    f"  - Step {step.step_id}: {step.title}\n"
+                    f"    Objective: {step.objective}\n"
+                    f"    Tools: {tool_list}\n"
+                    f"    Success Criteria: {step.success_criteria}\n",
                 )
-                context, sub_goal, tool_name = self.planner.extract_context_subgoal_and_tool(next_step)
-                if self.verbose:
-                    print(f"\n==> 🎯 Step {step_count}: Action Prediction ({tool_name})\n")
-                    print(f"[Context]: {context}\n[Sub Goal]: {sub_goal}\n[Tool]: {tool_name}")
-                    print(f"[Time]: {round(time.time() - local_start_time, 2)}s")
 
-                if tool_name is None or tool_name not in self.planner.available_tools:
-                    print(f"\n==> 🚫 Error: Tool '{tool_name}' is not available or not found.")
-                    command = "No command was generated because the tool was not found."
-                    result = "No result was generated because the tool was not found."
+        worker_manager = WorkerManager(
+            planner=self.planner,
+            executor=self.executor,
+            verbose=self.verbose,
+        )
 
-                else:
-                    # [3] Generate the tool command
-                    local_start_time = time.time()
-                    tool_command = self.executor.generate_tool_command(
-                        question, 
-                        image_path, 
-                        context, 
-                        sub_goal, 
-                        tool_name, 
-                        self.planner.toolbox_metadata[tool_name],
-                        step_count,
-                        json_data
-                    )
-                    analysis, explanation, command = self.executor.extract_explanation_and_command(tool_command)
-                    if self.verbose:
-                        print(f"\n==> 📝 Step {step_count}: Command Generation ({tool_name})\n")
-                        print(f"[Analysis]: {analysis}\n[Explanation]: {explanation}\n[Command]: {command}")
-                        print(f"[Time]: {round(time.time() - local_start_time, 2)}s")
-                    
-                    # [4] Execute the tool command
-                    local_start_time = time.time()
-                    result = self.executor.execute_tool_command(tool_name, command)
-                    result = make_json_serializable_truncated(result) # Convert to JSON serializable format
-                    json_data[f"tool_result_{step_count}"] = result
+        worker_reports = []
+        global_step_counter = 0
 
-                    if self.verbose:
-                        print(f"\n==> 🛠️ Step {step_count}: Command Execution ({tool_name})\n")
-                        print(f"[Result]:\n{json.dumps(result, indent=4)}")
-                        print(f"[Time]: {round(time.time() - local_start_time, 2)}s")
-                
-                # Track execution time for the current step
-                execution_time_step = round(time.time() - step_start_time, 2)
-                action_times.append(execution_time_step)
+        for plan_step in plan_outline.steps:
+            if self.verbose:
+                print(f"\n==> 🗂️ Planning Worker for Step {plan_step.step_id}: {plan_step.title}")
 
-                # Update memory
-                self.memory.add_action(step_count, tool_name, sub_goal, command, result)
-                memory_actions = self.memory.get_actions() # total memory actions up to now
+            worker_spec = self.planner.design_worker(
+                question=question,
+                plan_step=plan_step,
+                global_memory=self.memory,
+                existing_workers=worker_manager.list_workers(),
+                image=image_path,
+                json_data=json_data,
+            )
 
-                # [5] Verify memory (context verification)
-                local_start_time = time.time()
-                stop_verification = self.planner.verificate_context(
-                    question, 
-                    image_path, 
-                    query_analysis, 
-                    self.memory,
-                    step_count,
-                    json_data
+            if self.verbose:
+                print(
+                    f"    Worker: {worker_spec.worker_name} ({worker_spec.worker_role})\n"
+                    f"    Mission: {worker_spec.mission}\n"
+                    f"    Tools: {', '.join(worker_spec.tool_names) if worker_spec.tool_names else 'None'}",
                 )
-                context_verification, conclusion = self.planner.extract_conclusion(stop_verification)
-                if self.verbose:
-                    conclusion_emoji = "✅" if conclusion == 'STOP' else "🛑"
-                    print(f"\n==> 🤖 Step {step_count}: Context Verification\n")
-                    print(f"[Analysis]: {context_verification}\n[Conclusion]: {conclusion} {conclusion_emoji}")
-                    print(f"[Time]: {round(time.time() - local_start_time, 2)}s")
-                
-                # Break the loop if the context is verified
-                if conclusion == 'STOP':
-                    break
 
-            # Add memory and statistics to json_data
-            json_data.update({
-                "memory": memory_actions,
-                "step_count": step_count,
-                "execution_time": round(time.time() - query_start_time, 2),
-            })
+            worker = worker_manager.get_or_create_worker(worker_spec) # TODO
+            worker_report = worker.run(
+                question=question,
+                image=image_path,
+                plan_step=plan_step,
+                global_memory=self.memory,
+                max_steps=self.max_steps,
+                max_time=self.max_time,
+                json_data=json_data,
+            )
 
-            # Generate final output if requested
-            if 'final' in self.output_types:
-                final_output = self.planner.generate_final_output(question, image_path, self.memory)
-                json_data["final_output"] = final_output
+            worker_report_dict = worker_report.to_dict()
+            worker_reports.append(worker_report_dict)
+
+            for action in worker_report_dict["actions"]:
+                global_step_counter += 1
+                tool_name = action.get("tool_name") or "Unavailable_Tool"
+                sub_goal = action.get("sub_goal") or plan_step.objective
+                command = action.get("command") or ""
+                result = action.get("result")
+                self.memory.add_action(
+                    global_step_counter,
+                    tool_name,
+                    sub_goal,
+                    command,
+                    result,
+                )
+
+            if self.verbose:
+                print(
+                    f"    ✅ Worker {worker_spec.worker_name} status: {worker_report_dict['status']}\n"
+                    f"    Summary: {worker_report_dict['summary']}\n",
+                )
+
+        json_data["workers"] = worker_reports
+        json_data["memory"] = self.memory.get_actions()
+        json_data["step_count"] = global_step_counter
+        json_data["execution_time"] = round(time.time() - start_time, 2)
+        json_data["plan_completed"] = all(
+            report.get("status", "").lower().startswith("complete")
+            for report in worker_reports
+            if report
+        )
+
+        if "final" in self.output_types:
+            final_output = self.planner.generate_final_output(
+                question,
+                image_path,
+                self.memory,
+            )
+            json_data["final_output"] = final_output
+            if self.verbose:
                 print(f"\n==> 🐙 Detailed Solution:\n\n{final_output}")
 
-            # Generate direct output if requested
-            if 'direct' in self.output_types:
-                direct_output = self.planner.generate_direct_output(question, image_path, self.memory)
-                json_data["direct_output"] = direct_output
+        if "direct" in self.output_types:
+            direct_output = self.planner.generate_direct_output(
+                question,
+                image_path,
+                self.memory,
+            )
+            json_data["direct_output"] = direct_output
+            if self.verbose:
                 print(f"\n==> 🐙 Final Answer:\n\n{direct_output}")
 
-            print(f"\n[Total Time]: {round(time.time() - query_start_time, 2)}s")
-            print(f"\n==> ✅ Query Solved!")
+        if self.verbose:
+            print(f"\n[Total Time]: {json_data['execution_time']}s")
+            print("\n==> ✅ Query Solved!")
 
         return json_data
 
@@ -230,11 +226,11 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
 
     # Instantiate Executor with tool instances cache
     executor = Executor(
-        # llm_engine_name=llm_engine_name,
-        llm_engine_name="dashscope",
+        llm_engine_name=llm_engine_name,
+        # llm_engine_name="dashscope",
         root_cache_dir=root_cache_dir,
         verbose=verbose,
-        # base_url=base_url,
+        base_url=base_url,
         temperature=temperature,
         tool_instances_cache=initializer.tool_instances_cache  # Pass the cached tool instances
     )
@@ -256,7 +252,7 @@ def construct_solver(llm_engine_name : str = "gpt-4o",
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Run the agentflow demo with specified parameters.")
-    parser.add_argument("--llm_engine_name", default="gpt-4o", help="LLM engine name.")
+    parser.add_argument("--llm_engine_name", default="vllm-Qwen/Qwen3-8B", help="LLM engine name.")
     parser.add_argument(
         "--output_types",
         default="base,final,direct",
@@ -271,22 +267,28 @@ def parse_arguments():
     return parser.parse_args()
     
 def main(args):
-    tool_engine=["dashscope-qwen2.5-3b-instruct","dashscope-qwen2.5-3b-instruct","Default","Default"]
+    tool_engine=["self","self",]
     solver = construct_solver(
         llm_engine_name=args.llm_engine_name,
-        enabled_tools=["Base_Generator_Tool","Python_Coder_Tool","Google_Search_Tool","Wikipedia_Search_Tool"],
+        enabled_tools=["Base_Generator_Tool","Python_Coder_Tool"],
         tool_engine=tool_engine,
         output_types=args.output_types,
         max_steps=args.max_steps,
         max_time=args.max_time,
         max_tokens=args.max_tokens,
-        # base_url="http://localhost:8080/v1",
+        base_url="http://localhost:8080/v1",
         verbose=args.verbose,
         temperature=0.7
     )
 
     # Solve the task or problem
     solver.solve("What is the capital of France?")
+    # solver.solve(
+    #     "Below is a piece of text. Please count the top 5 most frequent English words and provide a brief summary of the themes expressed by these high-frequency words: Text:'Machine learning enables computers to learn from data. Machine learning models improve as more data becomes available. Data-driven methods are essential in modern machine learning workflows.'"
+    # )
+    # solver.solve(
+    #     "Here are three numbers: 3, 7, 2. Please calculate their average and tell me in one sentence what this average indicates."
+    # )
 
 if __name__ == "__main__":
     args = parse_arguments()
