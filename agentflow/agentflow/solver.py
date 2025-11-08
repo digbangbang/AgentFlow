@@ -49,6 +49,10 @@ class Solver:
             "image": image_path,
         }
 
+        self.planner.memory.add_user_input(question)
+        if image_path:
+            self.planner.memory.metadata.setdefault("images", []).append(image_path)
+
         if self.verbose:
             print(f"\n==> 🔍 Received Query: {question}")
             if image_path:
@@ -98,7 +102,7 @@ class Solver:
         worker_reports = []
         global_step_counter = 0
 
-        for plan_step in plan_outline.steps:
+        for plan_step in plan_outline.steps: # TODO while True to handle planner dynamically added steps
             if self.verbose:
                 print(f"\n==> 🗂️ Planning Worker for Step {plan_step.step_id}: {plan_step.title}")
 
@@ -131,6 +135,7 @@ class Solver:
 
             worker_report_dict = worker_report.to_dict()
             worker_reports.append(worker_report_dict)
+            self.planner.memory.metadata.setdefault("worker_run_reports", []).append(worker_report_dict)
 
             for action in worker_report_dict["actions"]:
                 global_step_counter += 1
@@ -255,7 +260,7 @@ def parse_arguments():
     parser.add_argument("--llm_engine_name", default="vllm-Qwen/Qwen3-8B", help="LLM engine name.")
     parser.add_argument(
         "--output_types",
-        default="base,final,direct",
+        default="final,direct",
         help="Comma-separated list of required outputs (base,final,direct)"
     )
     parser.add_argument("--enabled_tools", default="Base_Generator_Tool", help="List of enabled tools.")

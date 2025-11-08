@@ -16,7 +16,7 @@ from agentflow.models.formatters import (
     WorkerSpecification,
     WorkerSummary,
 )
-from agentflow.models.memory import Memory
+from agentflow.models.memory import Memory, PlannerMemory, WorkerMemory
 
 
 class Planner:
@@ -32,6 +32,9 @@ class Planner:
         self.available_tools = available_tools if available_tools is not None else []
 
         self.verbose = verbose
+        self.memory = PlannerMemory()
+        self.memory.metadata.setdefault("available_tools", self.available_tools)
+        self.memory.metadata.setdefault("toolbox_metadata", self.toolbox_metadata)
 
     def _coerce_plan_outline(self, raw_plan: Any, max_subtasks: int) -> PlanOutline:
         """Convert model output into PlanOutline, falling back if parsing fails."""
@@ -179,6 +182,8 @@ class Planner:
         self.base_response = self.llm_engine(input_data, max_tokens=max_tokens) # default system prompt with question
         # self.base_response = self.llm_engine_fixed(input_data, max_tokens=max_tokens)
 
+        self.memory.metadata.setdefault("base_responses", []).append(self.base_response)
+
         return self.base_response
 
     def generate_plan(
@@ -266,11 +271,12 @@ class Planner:
                 )
             else:
                 raw_plan = self.llm_engine(multimodal_prompt, response_format=PlanOutline)
+            plan = self._coerce_plan_outline(raw_plan, max_subtasks)
         except Exception as exc:
             if self.verbose:
                 print(f"Planner generate_plan structured call failed: {exc}")
-
-        plan = self._coerce_plan_outline(raw_plan, max_subtasks)
+        self.memory.add_system_note(multimodal_prompt)
+        self.memory.record_plan(plan)
 
         if json_data is not None:
             json_data["plan_prompt"] = multimodal_prompt
@@ -301,7 +307,7 @@ class Planner:
             indent=2,
         )
         # available_tools_str = json.dumps(self.available_tools, ensure_ascii=False)
-        image_info = self.get_image_info(image)
+        # image_info = self.get_image_info(image)
 
         prompt = f"""
         Task: You are coordinating workers for DynamicFlow.
@@ -351,11 +357,9 @@ class Planner:
         "system_prompt": "You are a dataset inspection worker. Load the dataset, summarize its schema, preview rows, and extract numerical columns."
         }}
         """
-        breakpoint()
         def _coerce_spec_construct(raw_spec: Any) -> WorkerSpecification:
             """Convert model output into WorkerSpecification, falling back if parsing fails."""
             parsed_payload = None
-            breakpoint()
             txt = raw_spec.strip()
             txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL).strip()
             
@@ -388,9 +392,15 @@ class Planner:
             return spec
 
         raw_spec: Any = None
-
-        raw_spec = self.llm_engine(prompt, response_format=WorkerSpecification)
-        spec = _coerce_spec_construct(raw_spec)
+        try:
+            raw_spec = self.llm_engine(prompt, response_format=WorkerSpecification)
+            spec = _coerce_spec_construct(raw_spec)
+        except Exception as exc:
+            if self.verbose:
+                print(f"Planner design_worker structured call failed: {exc}")
+                
+        self.memory.add_system_note(prompt)
+        self.memory.record_worker_spec(plan_step.step_id, spec)
 
         if json_data is not None:
             json_data[f"worker_{plan_step.step_id}_design_prompt"] = prompt
@@ -404,7 +414,7 @@ class Planner:
         image: str,
         plan_step: PlanStep,
         worker_spec: WorkerSpecification,
-        worker_memory: Memory,
+    worker_memory: WorkerMemory,
         global_memory: Memory,
         step_count: int,
         max_step_count: int,
@@ -450,24 +460,27 @@ Decide the optimal next action. Use ONLY the available tools. Respond using the 
                 key = f"worker_{worker_spec.worker_name}_step_{step_count}_predictor"
                 json_data[f"{key}_prompt"] = prompt
                 json_data[f"{key}_response"] = next_step.model_dump()
+            self.memory.record_worker_step(plan_step.step_id, next_step)
             return next_step
         except Exception as exc:
             if self.verbose:
                 print(f"Planner generate_worker_step failed, using fallback: {exc}")
             fallback_tool = worker_spec.tool_names[0] if worker_spec.tool_names else None
-            return NextStep(
+            fallback_step = NextStep(
                 justification="Fallback action due to model error.",
                 context="Refer to previous outputs and mission description to proceed manually.",
                 sub_goal=plan_step.objective,
                 tool_name=fallback_tool or "",
             )
+            self.memory.record_worker_step(plan_step.step_id, fallback_step)
+            return fallback_step
 
     def evaluate_worker_progress(
         self,
         question: str,
         plan_step: PlanStep,
         worker_spec: WorkerSpecification,
-        worker_memory: Memory,
+    worker_memory: WorkerMemory,
         global_memory: Memory,
         json_data: Any = None,
     ) -> WorkerProgressCheck:
@@ -509,23 +522,26 @@ Return a JSON object with fields:
                 key = f"worker_{worker_spec.worker_name}_progress"
                 json_data[f"{key}_prompt"] = prompt
                 json_data[f"{key}_response"] = evaluation.model_dump()
+            self.memory.record_worker_progress(plan_step.step_id, evaluation)
             return evaluation
         except Exception as exc:
             if self.verbose:
                 print(f"Planner evaluate_worker_progress failed, using fallback: {exc}")
-            return WorkerProgressCheck(
+            fallback_progress = WorkerProgressCheck(
                 analysis="Unable to assess progress due to parsing error.",
                 status="continue",
                 blockers="Assessment fallback invoked",
                 next_action="Planner should manually review worker outputs",
             )
+            self.memory.record_worker_progress(plan_step.step_id, fallback_progress)
+            return fallback_progress
 
     def summarize_worker_result(
         self,
         question: str,
         plan_step: PlanStep,
         worker_spec: WorkerSpecification,
-        worker_memory: Memory,
+    worker_memory: WorkerMemory,
         global_memory: Memory,
         json_data: Any = None,
     ) -> WorkerSummary:
@@ -564,16 +580,19 @@ Return a JSON object with fields:
                 key = f"worker_{worker_spec.worker_name}_summary"
                 json_data[f"{key}_prompt"] = prompt
                 json_data[f"{key}_response"] = summary.model_dump()
+            self.memory.record_worker_report(plan_step.step_id, summary)
             return summary
         except Exception as exc:
             if self.verbose:
                 print(f"Planner summarize_worker_result failed, using fallback: {exc}")
-            return WorkerSummary(
+            fallback_summary = WorkerSummary(
                 summary="Worker summary unavailable; planner must synthesize manually.",
                 follow_up="Investigate worker outputs manually.",
             )
+            self.memory.record_worker_report(plan_step.step_id, fallback_summary)
+            return fallback_summary
 
-    def analyze_query(self, question: str, image: str) -> str:
+    def analyze_query(self, question: str, image: str) -> str: # discard
         image_info = self.get_image_info(image)
 
         if self.is_multimodal:
@@ -1006,6 +1025,7 @@ Instructions:
         # final_output = self.llm_engine(input_data)
         final_output = self.llm_engine_fixed(input_data)
 
+        self.memory.metadata.setdefault("final_outputs", []).append(final_output)
         return final_output
 
 
@@ -1057,5 +1077,6 @@ Output Structure:
         final_output = self.llm_engine_fixed(input_data)
         # final_output = self.llm_engine_mm(input_data)
 
+        self.memory.metadata.setdefault("direct_outputs", []).append(final_output)
         return final_output
 

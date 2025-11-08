@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from agentflow.models.memory import Memory
+from agentflow.models.memory import Memory, WorkerMemory
 from agentflow.models.utils import make_json_serializable_truncated
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checking
@@ -28,7 +28,6 @@ class WorkerRunReport:
     plan_step_id: int
     status: str
     summary: str
-    deliverables: List[str] = field(default_factory=list)
     follow_up: str = ""
     actions: List[Dict[str, Any]] = field(default_factory=list)
     progress_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -41,7 +40,6 @@ class WorkerRunReport:
             "plan_step_id": self.plan_step_id,
             "status": self.status,
             "summary": self.summary,
-            "deliverables": self.deliverables,
             "follow_up": self.follow_up,
             "actions": self.actions,
             "progress_history": self.progress_history,
@@ -60,11 +58,12 @@ class WorkerAgent:
         specification: WorkerSpecification,
         verbose: bool = False,
     ) -> None:
+        # TODO add workeragent's own llm_engine
         self.planner = planner
         self.executor = executor
         self.verbose = verbose
         self.specification = specification
-        self.memory = Memory()
+        self.memory = WorkerMemory()
 
     def describe(self) -> Dict[str, Any]:
         """Return metadata describing the worker for planner prompts."""
@@ -86,7 +85,7 @@ class WorkerAgent:
 
         self.specification = specification
         if reset_memory:
-            self.memory = Memory()
+            self.memory = WorkerMemory()
 
     def run(
         self,
@@ -97,7 +96,7 @@ class WorkerAgent:
         max_steps: int,
         max_time: int,
         json_data: Optional[Dict[str, Any]] = None,
-    ) -> WorkerRunReport:
+    ) -> WorkerRunReport: # TODO new workeragent cycle, use workeragent's own llm_engine to infer 
         """Execute the assigned plan step using planner-guided actions."""
 
         start_time = time.time()
@@ -208,12 +207,11 @@ class WorkerAgent:
             plan_step_id=plan_step.step_id,
             status=status,
             summary=summary.summary,
-            deliverables=summary.deliverables,
             follow_up=summary.follow_up,
             actions=actions,
             progress_history=progress_history,
             elapsed_time=elapsed_time,
-            memory_snapshot=self.memory.get_actions(),
+            memory_snapshot=self.memory.snapshot(),
         )
 
 
@@ -230,6 +228,7 @@ class WorkerManager:
         self.executor = executor
         self.verbose = verbose
         self._workers: Dict[str, WorkerAgent] = {}
+        self._worker_memories: Dict[str, WorkerMemory] = {}
 
     def list_workers(self) -> List[Dict[str, Any]]:
         return [worker.describe() for worker in self._workers.values()]
@@ -248,6 +247,8 @@ class WorkerManager:
                 verbose=self.verbose,
             )
             self._workers[specification.worker_name] = worker
+            self._worker_memories[specification.worker_name] = worker.memory
         else:
             worker.update_assignment(specification, reset_memory=reset_memory)
+            self._worker_memories[specification.worker_name] = worker.memory
         return worker
